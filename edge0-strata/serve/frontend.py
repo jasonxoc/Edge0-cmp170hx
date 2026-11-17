@@ -788,6 +788,9 @@ _PREFIX_BARE_OPEN = re.compile(r"<tool_call>\s*<function=\s*(tools|functions|def
 # #5276: `<toolcall>` / `<tool-call>` as the opener (then whitespace, `<function=NAME>`), and such an opener still arriving
 _MISSPELT_OPEN = re.compile(r"<tool-?call>(\s*)<function=(\s*[^<>\s]+\s*)>")
 _MISSPELT_PART = re.compile(r"<tool-?call>\s*<function=[^<>]{0,80}$|<tool-?call>\s*(?:<(?:f(?:u(?:n(?:c(?:t(?:i(?:o(?:n)?)?)?)?)?)?)?)?)?$")
+# the chat template's turn token written in place of the call's `<` (`<|im_start|>function=bash>`), and one still arriving
+_SPECIAL_FUNC = re.compile(r"<\|im_start\|>[ \t]*function=(\s*[^<>\s]+\s*)>")
+_SPECIAL_FUNC_PART = re.compile(r"<\|im_start\|>[ \t]*(?:f(?:u(?:n(?:c(?:t(?:i(?:o(?:n(?:=[^<>\s]{0,80})?)?)?)?)?)?)?)?)?$")
 _LOOSE_PART = re.compile(r"<\s*(?:function[ \t]*[=:]?\s*|=\s*)?[A-Za-z0-9_.\-]*\s*$")
 
 
@@ -1697,8 +1700,32 @@ class OutputParser:
             delta, self._held = self._held + delta, ""
         self.buf += delta
         if self.schemas and delta:
-            self._held = self._prefixed(len(delta))
+            special = self._special_func(len(delta))
+            self._held = self._prefixed(len(delta)) + special
         return self._feed()
+
+    def _special_func(self, fresh: int) -> str:
+        """`<|im_start|>function=NAME>` (the template's turn token in place of the `<` of the call tag; seen live on Edge0 145B
+        NVFP4 after `<tool_call>`) is `<function=NAME>` when NAME is a declared tool.  The token never belongs in an answer and
+        any other follower is left as it was.  Returns the tail of such a tag still arriving (held back by feed)."""
+        start = max(0, len(self.buf) - fresh - _PREFIX_LOOKBACK)
+        if "<|" not in self.buf[start:]:
+            return ""
+        def fix(m):
+            name = m.group(1).strip()
+            return FUNC_START + m.group(1) + ">" if self.aliases.get(name, name) in self.schemas else m.group(0)
+        buf = self.buf[:start] + _SPECIAL_FUNC.sub(fix, self.buf[start:])
+        m = _SPECIAL_FUNC_PART.search(buf, start)
+        tail = buf[m.start():] if m else ""
+        if not tail:                                        # the token itself still arriving as text
+            for k in range(min(len(buf) - start, 11), 1, -1):
+                if "<|im_start|>".startswith(buf[-k:]):
+                    tail = buf[-k:]
+                    break
+        if tail:
+            buf = buf[:len(buf) - len(tail)]
+        self.buf = buf
+        return tail
 
     def _feed(self) -> list[Event]:
         out: list[Event] = []
